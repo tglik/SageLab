@@ -142,21 +142,10 @@ app
           timestamp: ts(),
         });
 
-        // Real HITL gate: wait for USER_INPUT_RESPONSE (auto-approve after 60s for mock)
+        // Real HITL gate: suspend here until handleWsMessage receives USER_INPUT_RESPONSE.
+        // The promise resolves only when the user clicks a choice in the browser.
         const choice = await new Promise<string>((resolve) => {
           hitlResolver = resolve;
-          const timeout = setTimeout(() => {
-            if (hitlResolver === resolve) {
-              hitlResolver = null;
-              resolve("Launch sweep");
-            }
-          }, 60_000);
-          // Allow the resolver to cancel the timeout when called normally
-          const originalResolve = resolve;
-          hitlResolver = (c: string) => {
-            clearTimeout(timeout);
-            originalResolve(c);
-          };
         });
 
         send({ type: "STATUS", runId, message: `[mock] ${choice} — Literature sweep running…`, timestamp: ts() });
