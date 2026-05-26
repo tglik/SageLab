@@ -1,66 +1,115 @@
-// WebSocket runtime adapter for assistant-ui.
-// Connects to the server.js WebSocket endpoint and translates
-// ResearchEvents into assistant-ui message parts.
-//
-// In step 5 this gets wired to the real ClaudeCodeRuntime.
-// For now the server sends mock events.
+import type { ResearchEvent, OnEvent } from "@/shared/events";
 
-export type ResearchEvent =
-  | { type: "RUN_STARTED"; runId: string; workflowType: string; timestamp: string }
-  | { type: "STATUS"; runId: string; message: string; timestamp: string }
-  | { type: "SCOPE_CREATED"; runId: string; artifactPath: string; timestamp: string }
-  | { type: "TOOL_CALL_STARTED"; runId: string; tool: string; description: string; timestamp: string }
-  | { type: "TOOL_CALL_COMPLETED"; runId: string; tool: string; timestamp: string }
-  | { type: "ARTIFACT_CREATED"; runId: string; path: string; title: string; timestamp: string }
-  | { type: "USER_INPUT_REQUIRED"; runId: string; prompt: string; choices: string[]; contextArtifact?: string; timestamp: string }
-  | { type: "TEXT_DELTA"; runId: string; delta: string; timestamp: string }
-  | { type: "RUN_COMPLETED"; runId: string; artifactPaths: string[]; timestamp: string }
-  | { type: "RUN_FAILED"; runId: string; error: string; timestamp: string }
-  | { type: "COMMIT_CREATED"; runId: string; commitHash: string; message: string; timestamp: string };
+export type { ResearchEvent, OnEvent };
 
-export type OnEvent = (event: ResearchEvent) => void;
+type WsStatus = "connecting" | "connected" | "disconnected";
 
 export class SageLabWsRuntime {
   private ws: WebSocket | null = null;
   private listeners: Set<OnEvent> = new Set();
+  private statusListeners: Set<(s: WsStatus) => void> = new Set();
+  private pendingMessages: string[] = []; // D2: queue messages sent before socket opens
+  private activeRunId: string | null = null; // E4: track active run for WS-close reset
+  private token: string | undefined;
 
-  connect() {
+  connect(token?: string) {
+    this.token = token;
     if (this.ws?.readyState === WebSocket.OPEN) return;
-    const url = `ws://${window.location.host}/ws`;
+    if (this.ws?.readyState === WebSocket.CONNECTING) return;
+
+    // D3: auto-detect ws:// vs wss:// based on page protocol
+    const proto = window.location.protocol === "https:" ? "wss" : "ws";
+    const path = process.env.NEXT_PUBLIC_SAGELAB_WS_PATH || "/ws";
+    const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
+    const url = `${proto}://${window.location.host}${path}${tokenParam}`;
+
     this.ws = new WebSocket(url);
+    this.emitStatus("connecting");
+
+    this.ws.onopen = () => {
+      this.emitStatus("connected");
+      // D2: Flush messages that were queued while connecting
+      for (const msg of this.pendingMessages) {
+        this.ws!.send(msg);
+      }
+      this.pendingMessages = [];
+    };
 
     this.ws.onmessage = (e) => {
       try {
-        const event: ResearchEvent = JSON.parse(e.data);
+        const event = JSON.parse(e.data) as ResearchEvent;
+        if (event.type === "RUN_STARTED") this.activeRunId = event.runId;
+        if (event.type === "RUN_COMPLETED" || event.type === "RUN_FAILED") this.activeRunId = null;
         this.listeners.forEach((l) => l(event));
-      } catch {}
+      } catch (err) {
+        console.error("[ws] parse error:", err, e.data); // D7: was empty catch
+      }
     };
 
     this.ws.onclose = () => {
-      // Reconnect after 1s — replays USER_INPUT_REQUIRED on reconnect
-      setTimeout(() => this.connect(), 1000);
+      this.emitStatus("disconnected");
+      // E1: If a run was in progress when the socket closed, synthesize RUN_FAILED
+      // so the UI resets (running=false, input re-enables, error shown)
+      if (this.activeRunId !== null) {
+        const runId = this.activeRunId;
+        this.activeRunId = null;
+        const synthetic: ResearchEvent = {
+          type: "RUN_FAILED",
+          runId,
+          error: "Connection lost",
+          code: "WS_CLOSED",
+          timestamp: new Date().toISOString(),
+        };
+        this.listeners.forEach((l) => l(synthetic));
+      }
+      // Reconnect after 1s; server replays USER_INPUT_REQUIRED on reconnect
+      setTimeout(() => this.connect(this.token), 1000);
     };
   }
 
   subscribe(fn: OnEvent): () => void {
     this.listeners.add(fn);
-    return () => { this.listeners.delete(fn); };
+    return () => this.listeners.delete(fn);
+  }
+
+  subscribeStatus(fn: (s: WsStatus) => void): () => void {
+    this.statusListeners.add(fn);
+    return () => this.statusListeners.delete(fn);
   }
 
   sendRunRequest(query: string) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.connect();
-      // Wait for open then send
-      this.ws!.onopen = () => this.ws!.send(JSON.stringify({ type: "RUN_REQUEST", query }));
-      return;
+    // E4b: Validate query before sending
+    const q = query.trim();
+    if (!q) return;
+    if (q.length > 4096) {
+      console.warn("[ws] query exceeds 4KB limit, truncating");
     }
-    this.ws.send(JSON.stringify({ type: "RUN_REQUEST", query }));
+
+    const msg = JSON.stringify({ type: "RUN_REQUEST", query: q.slice(0, 4096) });
+
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(msg);
+    } else {
+      // D2: Queue message; will flush in onopen
+      this.pendingMessages.push(msg);
+      this.connect(this.token);
+    }
   }
 
   sendUserInputResponse(runId: string, choice: string) {
-    this.ws?.send(JSON.stringify({ type: "USER_INPUT_RESPONSE", runId, choice }));
+    const msg = JSON.stringify({ type: "USER_INPUT_RESPONSE", runId, choice });
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(msg); // E2: check readyState before sending
+    } else {
+      this.pendingMessages.push(msg); // E2: queue if not open, flush on reconnect
+    }
+  }
+
+  private emitStatus(status: WsStatus) {
+    this.statusListeners.forEach((l) => l(status));
   }
 }
 
 // Singleton — one connection per browser tab
-export const wsRuntime = typeof window !== "undefined" ? new SageLabWsRuntime() : null;
+export const wsRuntime =
+  typeof window !== "undefined" ? new SageLabWsRuntime() : null;
